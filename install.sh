@@ -734,9 +734,10 @@ EOF
 
   systemctl daemon-reload
 
-  echo "==> Включаем Caddy"
+  echo "==> Включаем и перезагружаем Caddy"
 
-  systemctl enable --now caddy.service
+  systemctl enable caddy.service
+  systemctl restart caddy.service
 
   if [[ "${ENABLE_UI_AUTOBOOT}" =~ ^[Yy]$ ]]; then
     systemctl enable "${SERVICES[@]}"
