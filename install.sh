@@ -53,7 +53,7 @@ require_root() {
 
 
 check_os() {
-  if ! grep -q '^ID=ubuntu' /etc/os-release ||
+  if ! grep -q '^ID=ubuntu' /etc/os-release || \
      ! grep -q '^VERSION_ID="24.04"' /etc/os-release; then
     echo "Этот скрипт рассчитан на Ubuntu 24.04."
     exit 1
@@ -61,6 +61,32 @@ check_os() {
 
   if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
     echo "Этот скрипт рассчитан на x86_64 / amd64."
+    exit 1
+  fi
+}
+
+
+validate_install_settings() {
+  if [[ ! "${DOMAIN}" =~ ^[A-Za-z0-9.-]+$ ]] || [[ "${DOMAIN}" != *.* ]]; then
+    echo "Некорректный домен: ${DOMAIN}"
+    echo "Пример: chat.example.com"
+    exit 1
+  fi
+
+  if [[ ! "${WORKSPACE_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "Некорректное имя Linux-пользователя: ${WORKSPACE_USER}"
+    exit 1
+  fi
+
+  if [[ ! "${SCREEN_WIDTH}" =~ ^[0-9]+$ ]] || \
+     [[ ! "${SCREEN_HEIGHT}" =~ ^[0-9]+$ ]] || \
+     [[ ! "${SCREEN_DEPTH}" =~ ^[0-9]+$ ]]; then
+    echo "Размер экрана и глубина цвета должны быть числами."
+    exit 1
+  fi
+
+  if [[ ! "${CPU_QUOTA}" =~ ^[0-9]+%$ ]]; then
+    echo "CPU quota должна выглядеть, например, как 70%."
     exit 1
   fi
 }
@@ -94,12 +120,16 @@ ask_install_settings() {
   read -r -p "Включить автозагрузку UI после reboot? [y/N]: " ENABLE_UI_AUTOBOOT
   ENABLE_UI_AUTOBOOT="${ENABLE_UI_AUTOBOOT:-N}"
 
+  validate_install_settings
+
   echo
+  echo "Выбрано:"
   echo "DOMAIN=${DOMAIN}"
   echo "WORKSPACE_USER=${WORKSPACE_USER}"
   echo "SCREEN=${SCREEN_WIDTH}x${SCREEN_HEIGHT}x${SCREEN_DEPTH}"
   echo "CPU_QUOTA=${CPU_QUOTA}"
   echo "SWAP_SIZE=${SWAP_SIZE}"
+  echo "UI_AUTOBOOT=${ENABLE_UI_AUTOBOOT}"
   echo
 }
 
@@ -107,7 +137,7 @@ ask_install_settings() {
 load_existing_config() {
   if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "Файл ${CONFIG_FILE} не найден."
-    echo "Сначала выполните установку."
+    echo "Сначала выполните установку (пункт 1)."
     return 1
   fi
 
@@ -139,13 +169,10 @@ is_installed() {
 }
 
 
-#
-# ВАЖНЫЙ FIX
-#
 ensure_user_directories() {
   local home="/home/${WORKSPACE_USER}"
 
-  echo "==> Проверяем права каталогов ${WORKSPACE_USER}"
+  echo "==> Проверяем права пользовательских каталогов"
 
   install -d -m 750 \
     -o "${WORKSPACE_USER}" \
@@ -192,13 +219,36 @@ ensure_user_directories() {
     -g "${WORKSPACE_USER}" \
     "${home}/projects"
 
-  #
-  # Это исправляет именно ту проблему, которую мы нашли.
-  #
   chown -R "${WORKSPACE_USER}:${WORKSPACE_USER}" \
     "${home}/.config" \
     "${home}/.cache" \
-    "${home}/.local"
+    "${home}/.local" \
+    "${home}/.vnc"
+}
+
+
+configure_default_browser() {
+  local home="/home/${WORKSPACE_USER}"
+
+  echo "==> Настраиваем Falkon браузером по умолчанию"
+
+  cat > "${home}/.config/mimeapps.list" <<'EOF'
+[Default Applications]
+x-scheme-handler/http=org.kde.falkon.desktop
+x-scheme-handler/https=org.kde.falkon.desktop
+text/html=org.kde.falkon.desktop
+
+[Added Associations]
+x-scheme-handler/http=org.kde.falkon.desktop;
+x-scheme-handler/https=org.kde.falkon.desktop;
+text/html=org.kde.falkon.desktop;
+EOF
+
+  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" \
+    "${home}/.config/mimeapps.list"
+
+  chmod 600 \
+    "${home}/.config/mimeapps.list"
 }
 
 
@@ -209,6 +259,10 @@ write_openbox_autostart() {
 
   cat > "${home}/.config/openbox/autostart" <<'EOF'
 xsetroot -solid "#1e1e1e" &
+
+# Синхронизация X11 clipboard / PRIMARY для VNC
+/usr/bin/autocutsel -fork
+/usr/bin/autocutsel -selection PRIMARY -fork
 
 xterm \
   -geometry 120x32+20+20 \
@@ -261,12 +315,12 @@ ensure_dns_points_here() {
   fi
 
   if ! grep -qx "${server_ip}" <<< "${dns_ips}"; then
-    echo "DNS не указывает на этот сервер."
+    echo "DNS для ${DOMAIN} не указывает на этот VPS."
     echo
-    echo "IP сервера:"
+    echo "IP VPS:"
     echo "${server_ip}"
     echo
-    echo "DNS:"
+    echo "DNS сейчас указывает на:"
     echo "${dns_ips}"
     exit 1
   fi
@@ -275,12 +329,67 @@ ensure_dns_points_here() {
 }
 
 
+install_caddy() {
+  if command -v caddy >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "==> Устанавливаем Caddy из официального репозитория"
+
+  DEBIAN_FRONTEND=noninteractive apt install -y \
+    debian-keyring \
+    debian-archive-keyring \
+    apt-transport-https \
+    curl \
+    gnupg
+
+  rm -f \
+    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+  curl -1sLf \
+    'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor \
+      -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+  curl -1sLf \
+    'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    -o /etc/apt/sources.list.d/caddy-stable.list
+
+  chmod o+r \
+    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+  chmod o+r \
+    /etc/apt/sources.list.d/caddy-stable.list
+
+  apt update
+
+  DEBIAN_FRONTEND=noninteractive apt install -y caddy
+}
+
+
+configure_firewall() {
+  echo "==> Настраиваем firewall"
+
+  local ssh_port
+
+  ssh_port="$(
+    sshd -T 2>/dev/null |
+      awk '$1 == "port" {print $2; exit}' || true
+  )"
+
+  ssh_port="${ssh_port:-22}"
+
+  ufw allow "${ssh_port}/tcp"
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+
+  ufw --force enable
+}
+
+
 start_ui_now() {
   load_existing_config || return 1
 
-  #
-  # Самовосстановление прав перед каждым запуском.
-  #
   ensure_user_directories
 
   echo "==> Запускаем UI"
@@ -293,7 +402,7 @@ start_ui_now() {
 
   echo
   echo "UI запущен:"
-  echo "https://${DOMAIN}/vnc.html?resize=scale&autoconnect=true"
+  echo "https://${DOMAIN}/"
 }
 
 
@@ -314,13 +423,17 @@ stop_ui_now() {
 restart_ui_now() {
   load_existing_config || return 1
 
+  ensure_user_directories
+
   echo "==> Перезапускаем UI"
 
-  stop_ui_now
+  systemctl restart chatgpt-xvfb.service
+  systemctl restart chatgpt-desktop.service
+  systemctl restart chatgpt-vnc.service
+  systemctl restart chatgpt-novnc.service
+  systemctl restart caddy.service
 
-  sleep 1
-
-  start_ui_now
+  echo "UI перезапущен."
 }
 
 
@@ -397,54 +510,45 @@ show_status() {
   echo
 
   echo "Процесс ChatGPT:"
-  if pgrep -afu "${WORKSPACE_USER}" '/usr/lib/chatgpt/ChatGPT' >/dev/null; then
-    pgrep -afu "${WORKSPACE_USER}" '/usr/lib/chatgpt/ChatGPT'
+
+  if pgrep -afu "${WORKSPACE_USER}" \
+    '/usr/lib/chatgpt/ChatGPT' >/dev/null; then
+
+    pgrep -afu "${WORKSPACE_USER}" \
+      '/usr/lib/chatgpt/ChatGPT'
+
   else
     echo "ChatGPT НЕ запущен."
   fi
 
   echo
+  echo "HTTPS-порты:"
+
+  ss -ltnp |
+    grep -E ':80|:443' || true
+
+  echo
   echo "Последние логи ChatGPT:"
+
   tail -n 20 \
     "/home/${WORKSPACE_USER}/.local/state/chatgpt-desktop.log" \
     2>/dev/null || echo "Лог пока отсутствует."
 
   echo
-  echo "Краткий systemctl status:"
-  systemctl --no-pager --full status "${ALL_SERVICES[@]}" || true
-}
+  echo "Последние логи chatgpt-desktop:"
 
+  journalctl \
+    -u chatgpt-desktop.service \
+    -n 20 \
+    --no-pager || true
 
-install_caddy() {
-  if command -v caddy >/dev/null 2>&1; then
-    return
-  fi
+  echo
+  echo "Последние логи Caddy:"
 
-  echo "==> Устанавливаем Caddy из официального репозитория"
-
-  DEBIAN_FRONTEND=noninteractive apt install -y \
-    debian-keyring \
-    debian-archive-keyring \
-    apt-transport-https \
-    curl \
-    gnupg
-
-  curl -1sLf \
-    'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
-    gpg --dearmor \
-      -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-  curl -1sLf \
-    'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    -o /etc/apt/sources.list.d/caddy-stable.list
-
-  chmod o+r \
-    /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
-    /etc/apt/sources.list.d/caddy-stable.list
-
-  apt update
-
-  DEBIAN_FRONTEND=noninteractive apt install -y caddy
+  journalctl \
+    -u caddy.service \
+    -n 20 \
+    --no-pager || true
 }
 
 
@@ -452,14 +556,26 @@ install_everything() {
   if is_installed; then
     echo "Установка уже выполнялась ранее."
     echo
-    echo "Для существующей установки переустановка не нужна."
-    echo "Пункт 4 автоматически исправляет права каталогов."
+    echo "Если это новый VPS после переустановки ОС,"
+    echo "маркера установки быть не должно."
+    echo
+    echo "Для обычного запуска используйте пункт 4 или 7."
     return 0
   fi
 
   ask_install_settings
 
   echo "==> Обновляем список пакетов"
+
+  apt update
+
+  echo "==> Включаем репозиторий Universe"
+
+  DEBIAN_FRONTEND=noninteractive apt install -y \
+    software-properties-common
+
+  add-apt-repository -y universe
+
   apt update
 
   echo "==> Устанавливаем системные пакеты"
@@ -477,9 +593,12 @@ install_everything() {
     websockify \
     openbox \
     python3-xdg \
+    xdg-utils \
     x11-xserver-utils \
+    autocutsel \
     xterm \
     xfonts-base \
+    falkon \
     tmux \
     vim \
     nano \
@@ -487,7 +606,7 @@ install_everything() {
     htop \
     ufw
 
-  echo "==> Создаём пользователя ${WORKSPACE_USER}"
+  echo "==> Создаём пользователя ${WORKSPACE_USER}, если его ещё нет"
 
   if ! id "${WORKSPACE_USER}" >/dev/null 2>&1; then
     adduser \
@@ -498,17 +617,15 @@ install_everything() {
 
   echo
   echo "==> Задайте пароль Linux-пользователя ${WORKSPACE_USER}"
+
   passwd "${WORKSPACE_USER}"
 
-  #
-  # FIX: создаём .config отдельно с правильным владельцем.
-  #
   ensure_user_directories
+  configure_default_browser
 
   echo
   echo "==> Создайте отдельный пароль VNC"
-  echo "Это НЕ Linux-пароль и НЕ пароль ChatGPT."
-  echo
+  echo "Это не Linux-пароль и не пароль ChatGPT."
 
   runuser -l "${WORKSPACE_USER}" \
     -c 'x11vnc -storepasswd'
@@ -517,10 +634,17 @@ install_everything() {
 
   echo "==> Создаём swap, если его ещё нет"
 
-  if ! swapon --show=NAME | grep -qx '/swapfile'; then
-    fallocate -l "${SWAP_SIZE}" /swapfile
+  if ! swapon --show=NAME |
+    grep -qx '/swapfile'; then
+
+    fallocate \
+      -l "${SWAP_SIZE}" \
+      /swapfile
+
     chmod 600 /swapfile
+
     mkswap /swapfile
+
     swapon /swapfile
   fi
 
@@ -543,17 +667,16 @@ install_everything() {
   DEBIAN_FRONTEND=noninteractive apt install -y \
     /root/Downloads/chatgpt_amd64.deb
 
-  rm -f /root/Downloads/chatgpt_amd64.deb
+  rm -f \
+    /root/Downloads/chatgpt_amd64.deb
 
   if [[ ! -x /usr/bin/chatgpt ]]; then
-    echo "ОШИБКА: /usr/bin/chatgpt не найден."
+    echo "ОШИБКА: /usr/bin/chatgpt не найден после установки."
     exit 1
   fi
 
-  #
-  # Ещё раз после установки пакета.
-  #
   ensure_user_directories
+  configure_default_browser
 
   echo "==> Создаём сервис Xvfb"
 
@@ -572,11 +695,11 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-  echo "==> Создаём сервис Openbox"
+  echo "==> Создаём сервис Openbox + ChatGPT"
 
   cat > /etc/systemd/system/chatgpt-desktop.service <<EOF
 [Unit]
-Description=Openbox session with ChatGPT and terminal
+Description=Openbox session with ChatGPT, Falkon and terminal
 After=chatgpt-xvfb.service
 Requires=chatgpt-xvfb.service
 
@@ -584,10 +707,16 @@ Requires=chatgpt-xvfb.service
 User=${WORKSPACE_USER}
 Group=${WORKSPACE_USER}
 
+RuntimeDirectory=chatgpt-workspace
+RuntimeDirectoryMode=0700
+
 Environment=DISPLAY=${DISPLAY_NUM}
 Environment=HOME=/home/${WORKSPACE_USER}
+Environment=XDG_RUNTIME_DIR=/run/chatgpt-workspace
 Environment=XDG_CONFIG_HOME=/home/${WORKSPACE_USER}/.config
 Environment=XDG_CACHE_HOME=/home/${WORKSPACE_USER}/.cache
+Environment=XDG_CURRENT_DESKTOP=Openbox
+Environment=BROWSER=/usr/bin/falkon
 
 WorkingDirectory=/home/${WORKSPACE_USER}
 
@@ -615,16 +744,9 @@ Requires=chatgpt-desktop.service
 User=${WORKSPACE_USER}
 Group=${WORKSPACE_USER}
 
-ExecStart=/usr/bin/x11vnc \
--display ${DISPLAY_NUM} \
--localhost \
--rfbport ${VNC_PORT} \
--rfbauth /home/${WORKSPACE_USER}/.vnc/passwd \
--forever \
--shared \
--noxrecord \
--noxfixes \
--noxdamage
+Environment=DISPLAY=${DISPLAY_NUM}
+
+ExecStart=/usr/bin/x11vnc -display ${DISPLAY_NUM} -localhost -rfbport ${VNC_PORT} -rfbauth /home/${WORKSPACE_USER}/.vnc/passwd -forever -shared -noxrecord -noxfixes -noxdamage
 
 Restart=always
 RestartSec=3
@@ -645,10 +767,7 @@ Requires=chatgpt-vnc.service
 User=${WORKSPACE_USER}
 Group=${WORKSPACE_USER}
 
-ExecStart=/usr/bin/websockify \
---web=/usr/share/novnc \
-127.0.0.1:${NOVNC_PORT} \
-127.0.0.1:${VNC_PORT}
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT}
 
 Restart=always
 RestartSec=3
@@ -662,41 +781,47 @@ EOF
   ensure_dns_points_here
 
   echo
+
   read -r -p \
-    "Логин для HTTPS-доступа через Caddy [chatuser]: " \
+    "Введите логин для HTTPS-доступа через Caddy [chatuser]: " \
     CADDY_USER
 
   CADDY_USER="${CADDY_USER:-chatuser}"
 
   echo
+
   read -r -s -p \
-    "Пароль для HTTPS-доступа через Caddy: " \
+    "Введите пароль для HTTPS-доступа через Caddy: " \
     CADDY_PASS
+
   echo
 
   read -r -s -p \
-    "Повторите пароль: " \
+    "Повторите пароль для HTTPS-доступа через Caddy: " \
     CADDY_PASS2
+
   echo
 
   if [[ -z "${CADDY_PASS}" ]]; then
-    echo "Пароль не может быть пустым."
+    echo "Пароль Caddy не может быть пустым."
     exit 1
   fi
 
   if [[ "${CADDY_PASS}" != "${CADDY_PASS2}" ]]; then
-    echo "Пароли не совпадают."
+    echo "Пароли Caddy не совпадают."
     exit 1
   fi
 
-  echo "==> Хэшируем пароль"
+  echo "==> Хэшируем пароль Caddy"
 
   CADDY_HASH="$(
     caddy hash-password \
       --plaintext "${CADDY_PASS}"
   )"
 
-  unset CADDY_PASS CADDY_PASS2
+  unset \
+    CADDY_PASS \
+    CADDY_PASS2
 
   echo "==> Создаём Caddyfile"
 
@@ -717,48 +842,61 @@ EOF
     --overwrite \
     /etc/caddy/Caddyfile
 
-  echo "==> Проверяем Caddy"
+  echo "==> Проверяем конфигурацию Caddy"
 
   caddy validate \
     --config /etc/caddy/Caddyfile \
     --adapter caddyfile
 
-  echo "==> Настраиваем firewall"
-
-  ufw allow OpenSSH
-  ufw allow 80/tcp
-  ufw allow 443/tcp
-  ufw --force enable
+  configure_firewall
 
   echo "==> Перечитываем systemd"
 
   systemctl daemon-reload
 
-  echo "==> Включаем и перезагружаем Caddy"
+  echo "==> Включаем и перезапускаем Caddy"
 
   systemctl enable caddy.service
   systemctl restart caddy.service
 
   if [[ "${ENABLE_UI_AUTOBOOT}" =~ ^[Yy]$ ]]; then
+
+    echo "==> Включаем автозагрузку UI"
+
     systemctl enable "${SERVICES[@]}"
+
   else
-    echo "UI после reboot автоматически запускаться не будет."
+
+    echo "==> UI после reboot автоматически запускаться не будет"
+
   fi
 
   save_config
+
   touch "${INSTALL_MARKER}"
+
+  echo "==> Запускаем UI сейчас"
 
   start_ui_now
 
   echo
-  echo "================================================"
+  echo "============================================================"
   echo "Установка завершена."
   echo
-  echo "https://${DOMAIN}/vnc.html?resize=scale&autoconnect=true"
+  echo "Откройте:"
+  echo "https://${DOMAIN}/"
   echo
-  echo "Лог ChatGPT:"
-  echo "/home/${WORKSPACE_USER}/.local/state/chatgpt-desktop.log"
-  echo "================================================"
+  echo "Первый вход:"
+  echo "1. Caddy: логин ${CADDY_USER} и заданный HTTPS-пароль."
+  echo "2. noVNC: отдельный VNC-пароль."
+  echo "3. Внутри рабочего стола запустится ChatGPT и Terminal."
+  echo "4. При входе в ChatGPT браузер должен открыться в Falkon."
+  echo "5. Для текста работает clipboard noVNC/X11."
+  echo
+  echo "Если что-то не работает:"
+  echo "bash install.sh"
+  echo "затем пункт 6"
+  echo "============================================================"
 }
 
 
@@ -782,6 +920,7 @@ main() {
   check_os
 
   while true; do
+
     show_menu
 
     read -r -p "Выберите пункт: " choice
@@ -794,7 +933,7 @@ main() {
 
       2)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           enable_ui_autoload
         fi
@@ -802,7 +941,7 @@ main() {
 
       3)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           disable_ui_autoload
         fi
@@ -810,7 +949,7 @@ main() {
 
       4)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           start_ui_now
         fi
@@ -818,7 +957,7 @@ main() {
 
       5)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           stop_ui_now
         fi
@@ -826,7 +965,7 @@ main() {
 
       6)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           show_status
         fi
@@ -834,7 +973,7 @@ main() {
 
       7)
         if ! is_installed; then
-          echo "Сначала выполните установку."
+          echo "Сначала выполните установку (пункт 1)."
         else
           restart_ui_now
         fi
@@ -850,6 +989,7 @@ main() {
         ;;
 
     esac
+
   done
 }
 
