@@ -18,6 +18,8 @@ SWAP_SIZE_DEFAULT="2G"
 INSTALL_MARKER="/etc/chatgpt-vps-installed"
 CONFIG_FILE="/etc/chatgpt-vps.conf"
 
+CADDY_ACME_STAGING_URL="https://acme-staging-v02.api.letsencrypt.org/directory"
+
 SERVICES=(
   chatgpt-xvfb.service
   chatgpt-desktop.service
@@ -41,6 +43,10 @@ SCREEN_DEPTH=""
 CPU_QUOTA=""
 SWAP_SIZE=""
 ENABLE_UI_AUTOBOOT=""
+
+CADDY_USER=""
+CADDY_HASH=""
+CADDY_ACME_MODE=""
 
 
 require_root() {
@@ -158,6 +164,9 @@ VNC_PORT="${VNC_PORT}"
 NOVNC_PORT="${NOVNC_PORT}"
 CPU_QUOTA="${CPU_QUOTA}"
 SWAP_SIZE="${SWAP_SIZE}"
+CADDY_USER="${CADDY_USER}"
+CADDY_HASH="${CADDY_HASH}"
+CADDY_ACME_MODE="${CADDY_ACME_MODE}"
 EOF
 
   chmod 600 "${CONFIG_FILE}"
@@ -260,7 +269,6 @@ write_openbox_autostart() {
   cat > "${home}/.config/openbox/autostart" <<'EOF'
 xsetroot -solid "#1e1e1e" &
 
-# Синхронизация X11 clipboard / PRIMARY для VNC
 /usr/bin/autocutsel -fork
 /usr/bin/autocutsel -selection PRIMARY -fork
 
@@ -343,8 +351,7 @@ install_caddy() {
     curl \
     gnupg
 
-  rm -f \
-    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
   curl -1sLf \
     'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -355,14 +362,10 @@ install_caddy() {
     'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
     -o /etc/apt/sources.list.d/caddy-stable.list
 
-  chmod o+r \
-    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-
-  chmod o+r \
-    /etc/apt/sources.list.d/caddy-stable.list
+  chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  chmod o+r /etc/apt/sources.list.d/caddy-stable.list
 
   apt update
-
   DEBIAN_FRONTEND=noninteractive apt install -y caddy
 }
 
@@ -384,6 +387,109 @@ configure_firewall() {
   ufw allow 443/tcp
 
   ufw --force enable
+}
+
+
+write_caddyfile() {
+  if [[ -z "${DOMAIN}" || -z "${CADDY_USER}" || -z "${CADDY_HASH}" || -z "${CADDY_ACME_MODE}" ]]; then
+    echo "ОШИБКА: недостаточно данных для генерации Caddyfile."
+    exit 1
+  fi
+
+  echo "==> Создаём Caddyfile (${CADDY_ACME_MODE})"
+
+  if [[ "${CADDY_ACME_MODE}" == "staging" ]]; then
+    cat > /etc/caddy/Caddyfile <<EOF
+{
+    acme_ca ${CADDY_ACME_STAGING_URL}
+}
+
+${DOMAIN} {
+    basic_auth {
+        ${CADDY_USER} ${CADDY_HASH}
+    }
+
+    @root path /
+    redir @root /vnc.html?resize=scale&autoconnect=true 302
+
+    reverse_proxy 127.0.0.1:${NOVNC_PORT}
+}
+EOF
+  elif [[ "${CADDY_ACME_MODE}" == "production" ]]; then
+    cat > /etc/caddy/Caddyfile <<EOF
+${DOMAIN} {
+    basic_auth {
+        ${CADDY_USER} ${CADDY_HASH}
+    }
+
+    @root path /
+    redir @root /vnc.html?resize=scale&autoconnect=true 302
+
+    reverse_proxy 127.0.0.1:${NOVNC_PORT}
+}
+EOF
+  else
+    echo "ОШИБКА: неизвестный режим Caddy ACME: ${CADDY_ACME_MODE}"
+    exit 1
+  fi
+
+  caddy fmt --overwrite /etc/caddy/Caddyfile
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+
+
+reload_caddy_with_current_mode() {
+  write_caddyfile
+
+  echo "==> Перезагружаем Caddy"
+  systemctl reload caddy.service
+}
+
+
+switch_caddy_acme_mode() {
+  load_existing_config || return 1
+
+  echo
+  echo "Текущий режим Caddy TLS: ${CADDY_ACME_MODE}"
+  echo "1. staging"
+  echo "2. production"
+  echo
+
+  local choice
+  read -r -p "Выберите режим: " choice
+
+  case "${choice}" in
+    1)
+      if [[ "${CADDY_ACME_MODE}" == "staging" ]]; then
+        echo "Caddy уже в режиме staging."
+        return 0
+      fi
+      CADDY_ACME_MODE="staging"
+      ;;
+    2)
+      if [[ "${CADDY_ACME_MODE}" == "production" ]]; then
+        echo "Caddy уже в режиме production."
+        return 0
+      fi
+      CADDY_ACME_MODE="production"
+      ;;
+    *)
+      echo "Неверный пункт."
+      return 1
+      ;;
+  esac
+
+  save_config
+  reload_caddy_with_current_mode
+
+  echo
+  echo "Готово. Новый режим Caddy TLS: ${CADDY_ACME_MODE}"
+
+  if [[ "${CADDY_ACME_MODE}" == "staging" ]]; then
+    echo "Браузер покажет предупреждение о недоверенном сертификате — это нормально для staging."
+  else
+    echo "Теперь Caddy будет пытаться получить production-сертификат."
+  fi
 }
 
 
@@ -496,6 +602,7 @@ show_status() {
   echo "==================== STATUS ===================="
   echo "DOMAIN=${DOMAIN}"
   echo "WORKSPACE_USER=${WORKSPACE_USER}"
+  echo "CADDY_ACME_MODE=${CADDY_ACME_MODE}"
   echo "URL=https://${DOMAIN}/vnc.html?resize=scale&autoconnect=true"
   echo
 
@@ -510,45 +617,28 @@ show_status() {
   echo
 
   echo "Процесс ChatGPT:"
-
-  if pgrep -afu "${WORKSPACE_USER}" \
-    '/usr/lib/chatgpt/ChatGPT' >/dev/null; then
-
-    pgrep -afu "${WORKSPACE_USER}" \
-      '/usr/lib/chatgpt/ChatGPT'
-
+  if pgrep -afu "${WORKSPACE_USER}" '/usr/lib/chatgpt/ChatGPT' >/dev/null; then
+    pgrep -afu "${WORKSPACE_USER}" '/usr/lib/chatgpt/ChatGPT'
   else
     echo "ChatGPT НЕ запущен."
   fi
 
   echo
   echo "HTTPS-порты:"
-
-  ss -ltnp |
-    grep -E ':80|:443' || true
+  ss -ltnp | grep -E ':80|:443' || true
 
   echo
   echo "Последние логи ChatGPT:"
-
-  tail -n 20 \
-    "/home/${WORKSPACE_USER}/.local/state/chatgpt-desktop.log" \
+  tail -n 20 "/home/${WORKSPACE_USER}/.local/state/chatgpt-desktop.log" \
     2>/dev/null || echo "Лог пока отсутствует."
 
   echo
   echo "Последние логи chatgpt-desktop:"
-
-  journalctl \
-    -u chatgpt-desktop.service \
-    -n 20 \
-    --no-pager || true
+  journalctl -u chatgpt-desktop.service -n 20 --no-pager || true
 
   echo
   echo "Последние логи Caddy:"
-
-  journalctl \
-    -u caddy.service \
-    -n 20 \
-    --no-pager || true
+  journalctl -u caddy.service -n 20 --no-pager || true
 }
 
 
@@ -566,20 +656,14 @@ install_everything() {
   ask_install_settings
 
   echo "==> Обновляем список пакетов"
-
   apt update
 
   echo "==> Включаем репозиторий Universe"
-
-  DEBIAN_FRONTEND=noninteractive apt install -y \
-    software-properties-common
-
+  DEBIAN_FRONTEND=noninteractive apt install -y software-properties-common
   add-apt-repository -y universe
-
   apt update
 
   echo "==> Устанавливаем системные пакеты"
-
   DEBIAN_FRONTEND=noninteractive apt install -y \
     ca-certificates \
     curl \
@@ -607,7 +691,6 @@ install_everything() {
     ufw
 
   echo "==> Создаём пользователя ${WORKSPACE_USER}, если его ещё нет"
-
   if ! id "${WORKSPACE_USER}" >/dev/null 2>&1; then
     adduser \
       --disabled-password \
@@ -617,7 +700,6 @@ install_everything() {
 
   echo
   echo "==> Задайте пароль Linux-пользователя ${WORKSPACE_USER}"
-
   passwd "${WORKSPACE_USER}"
 
   ensure_user_directories
@@ -626,25 +708,15 @@ install_everything() {
   echo
   echo "==> Создайте отдельный пароль VNC"
   echo "Это не Linux-пароль и не пароль ChatGPT."
-
-  runuser -l "${WORKSPACE_USER}" \
-    -c 'x11vnc -storepasswd'
+  runuser -l "${WORKSPACE_USER}" -c 'x11vnc -storepasswd'
 
   write_openbox_autostart
 
   echo "==> Создаём swap, если его ещё нет"
-
-  if ! swapon --show=NAME |
-    grep -qx '/swapfile'; then
-
-    fallocate \
-      -l "${SWAP_SIZE}" \
-      /swapfile
-
+  if ! swapon --show=NAME | grep -qx '/swapfile'; then
+    fallocate -l "${SWAP_SIZE}" /swapfile
     chmod 600 /swapfile
-
     mkswap /swapfile
-
     swapon /swapfile
   fi
 
@@ -653,7 +725,6 @@ install_everything() {
   fi
 
   echo "==> Загружаем ChatGPT Desktop"
-
   mkdir -p /root/Downloads
 
   wget \
@@ -663,12 +734,8 @@ install_everything() {
     https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb
 
   echo "==> Устанавливаем ChatGPT Desktop"
-
-  DEBIAN_FRONTEND=noninteractive apt install -y \
-    /root/Downloads/chatgpt_amd64.deb
-
-  rm -f \
-    /root/Downloads/chatgpt_amd64.deb
+  DEBIAN_FRONTEND=noninteractive apt install -y /root/Downloads/chatgpt_amd64.deb
+  rm -f /root/Downloads/chatgpt_amd64.deb
 
   if [[ ! -x /usr/bin/chatgpt ]]; then
     echo "ОШИБКА: /usr/bin/chatgpt не найден после установки."
@@ -679,7 +746,6 @@ install_everything() {
   configure_default_browser
 
   echo "==> Создаём сервис Xvfb"
-
   cat > /etc/systemd/system/chatgpt-xvfb.service <<EOF
 [Unit]
 Description=Virtual X11 display for ChatGPT Desktop
@@ -696,7 +762,6 @@ WantedBy=multi-user.target
 EOF
 
   echo "==> Создаём сервис Openbox + ChatGPT"
-
   cat > /etc/systemd/system/chatgpt-desktop.service <<EOF
 [Unit]
 Description=Openbox session with ChatGPT, Falkon and terminal
@@ -733,7 +798,6 @@ WantedBy=multi-user.target
 EOF
 
   echo "==> Создаём VNC сервис"
-
   cat > /etc/systemd/system/chatgpt-vnc.service <<EOF
 [Unit]
 Description=Local VNC server for ChatGPT Desktop
@@ -756,7 +820,6 @@ WantedBy=multi-user.target
 EOF
 
   echo "==> Создаём noVNC сервис"
-
   cat > /etc/systemd/system/chatgpt-novnc.service <<EOF
 [Unit]
 Description=Local noVNC gateway for ChatGPT Desktop
@@ -777,29 +840,16 @@ WantedBy=multi-user.target
 EOF
 
   install_caddy
-
   ensure_dns_points_here
 
   echo
-
-  read -r -p \
-    "Введите логин для HTTPS-доступа через Caddy [chatuser]: " \
-    CADDY_USER
-
+  read -r -p "Введите логин для HTTPS-доступа через Caddy [chatuser]: " CADDY_USER
   CADDY_USER="${CADDY_USER:-chatuser}"
 
   echo
-
-  read -r -s -p \
-    "Введите пароль для HTTPS-доступа через Caddy: " \
-    CADDY_PASS
-
+  read -r -s -p "Введите пароль для HTTPS-доступа через Caddy: " CADDY_PASS
   echo
-
-  read -r -s -p \
-    "Повторите пароль для HTTPS-доступа через Caddy: " \
-    CADDY_PASS2
-
+  read -r -s -p "Повторите пароль для HTTPS-доступа через Caddy: " CADDY_PASS2
   echo
 
   if [[ -z "${CADDY_PASS}" ]]; then
@@ -813,70 +863,35 @@ EOF
   fi
 
   echo "==> Хэшируем пароль Caddy"
-
   CADDY_HASH="$(
-    caddy hash-password \
-      --plaintext "${CADDY_PASS}"
+    caddy hash-password --plaintext "${CADDY_PASS}"
   )"
 
-  unset \
-    CADDY_PASS \
-    CADDY_PASS2
+  unset CADDY_PASS CADDY_PASS2
 
-  echo "==> Создаём Caddyfile"
-
-  cat > /etc/caddy/Caddyfile <<EOF
-${DOMAIN} {
-    basic_auth {
-        ${CADDY_USER} ${CADDY_HASH}
-    }
-
-    @root path /
-    redir @root /vnc.html?resize=scale&autoconnect=true 302
-
-    reverse_proxy 127.0.0.1:${NOVNC_PORT}
-}
-EOF
-
-  caddy fmt \
-    --overwrite \
-    /etc/caddy/Caddyfile
-
-  echo "==> Проверяем конфигурацию Caddy"
-
-  caddy validate \
-    --config /etc/caddy/Caddyfile \
-    --adapter caddyfile
+  CADDY_ACME_MODE="staging"
+  write_caddyfile
 
   configure_firewall
 
   echo "==> Перечитываем systemd"
-
   systemctl daemon-reload
 
   echo "==> Включаем и перезапускаем Caddy"
-
   systemctl enable caddy.service
   systemctl restart caddy.service
 
   if [[ "${ENABLE_UI_AUTOBOOT}" =~ ^[Yy]$ ]]; then
-
     echo "==> Включаем автозагрузку UI"
-
     systemctl enable "${SERVICES[@]}"
-
   else
-
     echo "==> UI после reboot автоматически запускаться не будет"
-
   fi
 
   save_config
-
   touch "${INSTALL_MARKER}"
 
   echo "==> Запускаем UI сейчас"
-
   start_ui_now
 
   echo
@@ -885,6 +900,10 @@ EOF
   echo
   echo "Откройте:"
   echo "https://${DOMAIN}/"
+  echo
+  echo "ВАЖНО: сейчас Caddy работает в режиме STAGING."
+  echo "Браузер покажет предупреждение о недоверенном сертификате — это нормально."
+  echo "После проверки работоспособности переключите режим через пункт 8."
   echo
   echo "Первый вход:"
   echo "1. Caddy: логин ${CADDY_USER} и заданный HTTPS-пароль."
@@ -910,6 +929,7 @@ show_menu() {
   echo "5. Выключить все"
   echo "6. Статус"
   echo "7. Рестарт"
+  echo "8. Переключить TLS режим Caddy (staging / production)"
   echo "0. Выход"
   echo "=============================================="
 }
@@ -920,17 +940,13 @@ main() {
   check_os
 
   while true; do
-
     show_menu
-
     read -r -p "Выберите пункт: " choice
 
     case "${choice}" in
-
       1)
         install_everything
         ;;
-
       2)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -938,7 +954,6 @@ main() {
           enable_ui_autoload
         fi
         ;;
-
       3)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -946,7 +961,6 @@ main() {
           disable_ui_autoload
         fi
         ;;
-
       4)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -954,7 +968,6 @@ main() {
           start_ui_now
         fi
         ;;
-
       5)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -962,7 +975,6 @@ main() {
           stop_ui_now
         fi
         ;;
-
       6)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -970,7 +982,6 @@ main() {
           show_status
         fi
         ;;
-
       7)
         if ! is_installed; then
           echo "Сначала выполните установку (пункт 1)."
@@ -978,18 +989,21 @@ main() {
           restart_ui_now
         fi
         ;;
-
+      8)
+        if ! is_installed; then
+          echo "Сначала выполните установку (пункт 1)."
+        else
+          switch_caddy_acme_mode
+        fi
+        ;;
       0)
         echo "Выход."
         exit 0
         ;;
-
       *)
         echo "Неверный пункт меню."
         ;;
-
     esac
-
   done
 }
 
