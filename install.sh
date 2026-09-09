@@ -19,6 +19,13 @@ INSTALL_MARKER="/etc/chatgpt-vps-installed"
 CONFIG_FILE="/etc/chatgpt-vps.conf"
 
 CADDY_ACME_STAGING_URL="https://acme-staging-v02.api.letsencrypt.org/directory"
+CADDY_LOG_DIR="/var/log/caddy"
+CADDY_ACCESS_LOG="${CADDY_LOG_DIR}/access.log"
+
+FAIL2BAN_JAIL_NAME="caddy-auth"
+FAIL2BAN_MAXRETRY="5"
+FAIL2BAN_FINDTIME="10m"
+FAIL2BAN_BANTIME="6h"
 
 SERVICES=(
   chatgpt-xvfb.service
@@ -33,6 +40,7 @@ ALL_SERVICES=(
   chatgpt-vnc.service
   chatgpt-novnc.service
   caddy.service
+  fail2ban.service
 )
 
 DOMAIN=""
@@ -136,6 +144,7 @@ ask_install_settings() {
   echo "CPU_QUOTA=${CPU_QUOTA}"
   echo "SWAP_SIZE=${SWAP_SIZE}"
   echo "UI_AUTOBOOT=${ENABLE_UI_AUTOBOOT}"
+  echo "FAIL2BAN=${FAIL2BAN_MAXRETRY} ошибок за ${FAIL2BAN_FINDTIME}, бан ${FAIL2BAN_BANTIME}"
   echo
 }
 
@@ -183,50 +192,15 @@ ensure_user_directories() {
 
   echo "==> Проверяем права пользовательских каталогов"
 
-  install -d -m 750 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.config"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.config/openbox"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.cache"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.local"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.local/share"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.local/state"
-
-  install -d -m 700 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/.vnc"
-
-  install -d -m 755 \
-    -o "${WORKSPACE_USER}" \
-    -g "${WORKSPACE_USER}" \
-    "${home}/projects"
+  install -d -m 750 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.config"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.config/openbox"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.cache"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.local"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.local/share"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.local/state"
+  install -d -m 700 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/.vnc"
+  install -d -m 755 -o "${WORKSPACE_USER}" -g "${WORKSPACE_USER}" "${home}/projects"
 
   chown -R "${WORKSPACE_USER}:${WORKSPACE_USER}" \
     "${home}/.config" \
@@ -253,11 +227,8 @@ x-scheme-handler/https=org.kde.falkon.desktop;
 text/html=org.kde.falkon.desktop;
 EOF
 
-  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" \
-    "${home}/.config/mimeapps.list"
-
-  chmod 600 \
-    "${home}/.config/mimeapps.list"
+  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" "${home}/.config/mimeapps.list"
+  chmod 600 "${home}/.config/mimeapps.list"
 }
 
 
@@ -288,11 +259,8 @@ xterm \
 ) &
 EOF
 
-  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" \
-    "${home}/.config/openbox/autostart"
-
-  chmod 700 \
-    "${home}/.config/openbox/autostart"
+  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" "${home}/.config/openbox/autostart"
+  chmod 700 "${home}/.config/openbox/autostart"
 }
 
 
@@ -353,13 +321,10 @@ install_caddy() {
 
   rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
-  curl -1sLf \
-    'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor \
-      -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
-  curl -1sLf \
-    'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
     -o /etc/apt/sources.list.d/caddy-stable.list
 
   chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -367,6 +332,49 @@ install_caddy() {
 
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y caddy
+}
+
+
+install_fail2ban() {
+  echo "==> Устанавливаем fail2ban"
+  DEBIAN_FRONTEND=noninteractive apt install -y fail2ban
+
+  install -d -m 755 /etc/fail2ban/filter.d
+  install -d -m 755 /etc/fail2ban/jail.d
+}
+
+
+write_fail2ban_filter() {
+  echo "==> Создаём filter для Caddy JSON access log"
+
+  cat > /etc/fail2ban/filter.d/caddy-auth-json.conf <<'EOF'
+[Definition]
+datepattern = LongEpoch
+failregex = ^.*"remote_ip":"<HOST>".*"status":401.*$
+ignoreregex =
+EOF
+
+  chmod 644 /etc/fail2ban/filter.d/caddy-auth-json.conf
+}
+
+
+write_fail2ban_jail() {
+  echo "==> Создаём jail fail2ban"
+
+  cat > /etc/fail2ban/jail.d/caddy-auth.local <<EOF
+[${FAIL2BAN_JAIL_NAME}]
+enabled = true
+filter = caddy-auth-json
+logpath = ${CADDY_ACCESS_LOG}
+backend = auto
+port = http,https
+findtime = ${FAIL2BAN_FINDTIME}
+maxretry = ${FAIL2BAN_MAXRETRY}
+bantime = ${FAIL2BAN_BANTIME}
+banaction = nftables-multiport
+EOF
+
+  chmod 644 /etc/fail2ban/jail.d/caddy-auth.local
 }
 
 
@@ -390,11 +398,21 @@ configure_firewall() {
 }
 
 
+ensure_caddy_log_dir() {
+  install -d -m 750 -o caddy -g adm "${CADDY_LOG_DIR}"
+  touch "${CADDY_ACCESS_LOG}"
+  chown caddy:adm "${CADDY_ACCESS_LOG}"
+  chmod 640 "${CADDY_ACCESS_LOG}"
+}
+
+
 write_caddyfile() {
   if [[ -z "${DOMAIN}" || -z "${CADDY_USER}" || -z "${CADDY_HASH}" || -z "${CADDY_ACME_MODE}" ]]; then
     echo "ОШИБКА: недостаточно данных для генерации Caddyfile."
     exit 1
   fi
+
+  ensure_caddy_log_dir
 
   echo "==> Создаём Caddyfile (${CADDY_ACME_MODE})"
 
@@ -405,6 +423,11 @@ write_caddyfile() {
 }
 
 ${DOMAIN} {
+    log {
+        output file ${CADDY_ACCESS_LOG}
+        format json
+    }
+
     basic_auth {
         ${CADDY_USER} ${CADDY_HASH}
     }
@@ -418,6 +441,11 @@ EOF
   elif [[ "${CADDY_ACME_MODE}" == "production" ]]; then
     cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
+    log {
+        output file ${CADDY_ACCESS_LOG}
+        format json
+    }
+
     basic_auth {
         ${CADDY_USER} ${CADDY_HASH}
     }
@@ -443,6 +471,13 @@ reload_caddy_with_current_mode() {
 
   echo "==> Перезагружаем Caddy"
   systemctl reload caddy.service
+}
+
+
+reload_fail2ban() {
+  echo "==> Перезагружаем fail2ban"
+  systemctl enable fail2ban.service
+  systemctl restart fail2ban.service
 }
 
 
@@ -505,6 +540,7 @@ start_ui_now() {
   systemctl start chatgpt-vnc.service
   systemctl start chatgpt-novnc.service
   systemctl start caddy.service
+  systemctl start fail2ban.service || true
 
   echo
   echo "UI запущен:"
@@ -538,6 +574,7 @@ restart_ui_now() {
   systemctl restart chatgpt-vnc.service
   systemctl restart chatgpt-novnc.service
   systemctl restart caddy.service
+  systemctl restart fail2ban.service || true
 
   echo "UI перезапущен."
 }
@@ -550,6 +587,7 @@ enable_ui_autoload() {
 
   systemctl enable "${SERVICES[@]}"
   systemctl enable caddy.service
+  systemctl enable fail2ban.service
 
   echo "Автозагрузка включена."
 }
@@ -566,7 +604,7 @@ disable_ui_autoload() {
   systemctl disable chatgpt-xvfb.service || true
 
   echo "Автозагрузка UI выключена."
-  echo "Caddy оставляем включённым."
+  echo "Caddy и fail2ban оставляем включёнными."
 }
 
 
@@ -595,6 +633,41 @@ service_enabled_state() {
 }
 
 
+show_fail2ban_status() {
+  echo
+  echo "==================== FAIL2BAN ===================="
+  systemctl status fail2ban --no-pager -l || true
+  echo
+  fail2ban-client status || true
+  echo
+  fail2ban-client status "${FAIL2BAN_JAIL_NAME}" || true
+  echo "=================================================="
+}
+
+
+show_banned_ips() {
+  echo
+  echo "========== ЗАБАНЕННЫЕ IP (${FAIL2BAN_JAIL_NAME}) =========="
+  fail2ban-client status "${FAIL2BAN_JAIL_NAME}" || true
+  echo "==========================================================="
+}
+
+
+unban_ip_menu() {
+  local ip
+
+  read -r -p "Введите IP для разбана: " ip
+
+  if [[ -z "${ip}" ]]; then
+    echo "IP не указан."
+    return 1
+  fi
+
+  fail2ban-client set "${FAIL2BAN_JAIL_NAME}" unbanip "${ip}"
+  echo "Готово: ${ip} разбанен."
+}
+
+
 show_status() {
   load_existing_config || return 1
 
@@ -604,6 +677,7 @@ show_status() {
   echo "WORKSPACE_USER=${WORKSPACE_USER}"
   echo "CADDY_ACME_MODE=${CADDY_ACME_MODE}"
   echo "URL=https://${DOMAIN}/vnc.html?resize=scale&autoconnect=true"
+  echo "FAIL2BAN=${FAIL2BAN_JAIL_NAME}, maxretry=${FAIL2BAN_MAXRETRY}, findtime=${FAIL2BAN_FINDTIME}, bantime=${FAIL2BAN_BANTIME}"
   echo
 
   for svc in "${ALL_SERVICES[@]}"; do
@@ -633,12 +707,20 @@ show_status() {
     2>/dev/null || echo "Лог пока отсутствует."
 
   echo
+  echo "Последние access log Caddy:"
+  tail -n 20 "${CADDY_ACCESS_LOG}" 2>/dev/null || echo "Лог Caddy пока отсутствует."
+
+  echo
   echo "Последние логи chatgpt-desktop:"
   journalctl -u chatgpt-desktop.service -n 20 --no-pager || true
 
   echo
   echo "Последние логи Caddy:"
   journalctl -u caddy.service -n 20 --no-pager || true
+
+  echo
+  echo "Последние логи fail2ban:"
+  journalctl -u fail2ban.service -n 20 --no-pager || true
 }
 
 
@@ -688,7 +770,8 @@ install_everything() {
     nano \
     git \
     htop \
-    ufw
+    ufw \
+    fail2ban
 
   echo "==> Создаём пользователя ${WORKSPACE_USER}, если его ещё нет"
   if ! id "${WORKSPACE_USER}" >/dev/null 2>&1; then
@@ -840,6 +923,7 @@ WantedBy=multi-user.target
 EOF
 
   install_caddy
+  install_fail2ban
   ensure_dns_points_here
 
   echo
@@ -870,7 +954,10 @@ EOF
   unset CADDY_PASS CADDY_PASS2
 
   CADDY_ACME_MODE="staging"
+
   write_caddyfile
+  write_fail2ban_filter
+  write_fail2ban_jail
 
   configure_firewall
 
@@ -880,6 +967,8 @@ EOF
   echo "==> Включаем и перезапускаем Caddy"
   systemctl enable caddy.service
   systemctl restart caddy.service
+
+  reload_fail2ban
 
   if [[ "${ENABLE_UI_AUTOBOOT}" =~ ^[Yy]$ ]]; then
     echo "==> Включаем автозагрузку UI"
@@ -905,6 +994,12 @@ EOF
   echo "Браузер покажет предупреждение о недоверенном сертификате — это нормально."
   echo "После проверки работоспособности переключите режим через пункт 8."
   echo
+  echo "Защита brute force:"
+  echo "- fail2ban включён"
+  echo "- бан после ${FAIL2BAN_MAXRETRY} ошибок за ${FAIL2BAN_FINDTIME}"
+  echo "- длительность бана: ${FAIL2BAN_BANTIME}"
+  echo "- разбан можно сделать через меню"
+  echo
   echo "Первый вход:"
   echo "1. Caddy: логин ${CADDY_USER} и заданный HTTPS-пароль."
   echo "2. noVNC: отдельный VNC-пароль."
@@ -914,7 +1009,7 @@ EOF
   echo
   echo "Если что-то не работает:"
   echo "bash install.sh"
-  echo "затем пункт 6"
+  echo "затем пункт 6 / 9 / 10"
   echo "============================================================"
 }
 
@@ -930,6 +1025,9 @@ show_menu() {
   echo "6. Статус"
   echo "7. Рестарт"
   echo "8. Переключить TLS режим Caddy (staging / production)"
+  echo "9. Статус fail2ban"
+  echo "10. Показать забаненные IP"
+  echo "11. Разбанить IP"
   echo "0. Выход"
   echo "=============================================="
 }
@@ -994,6 +1092,27 @@ main() {
           echo "Сначала выполните установку (пункт 1)."
         else
           switch_caddy_acme_mode
+        fi
+        ;;
+      9)
+        if ! is_installed; then
+          echo "Сначала выполните установку (пункт 1)."
+        else
+          show_fail2ban_status
+        fi
+        ;;
+      10)
+        if ! is_installed; then
+          echo "Сначала выполните установку (пункт 1)."
+        else
+          show_banned_ips
+        fi
+        ;;
+      11)
+        if ! is_installed; then
+          echo "Сначала выполните установку (пункт 1)."
+        else
+          unban_ip_menu
         fi
         ;;
       0)
