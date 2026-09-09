@@ -27,6 +27,11 @@ FAIL2BAN_MAXRETRY="5"
 FAIL2BAN_FINDTIME="10m"
 FAIL2BAN_BANTIME="6h"
 
+CHROME_DEB_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+CHROME_DEB_FILE="/root/Downloads/google-chrome-stable_current_amd64.deb"
+BROWSER_BIN="/usr/bin/google-chrome-stable"
+BROWSER_DESKTOP_ID="google-chrome.desktop"
+
 SERVICES=(
   chatgpt-xvfb.service
   chatgpt-desktop.service
@@ -145,6 +150,7 @@ ask_install_settings() {
   echo "SWAP_SIZE=${SWAP_SIZE}"
   echo "UI_AUTOBOOT=${ENABLE_UI_AUTOBOOT}"
   echo "FAIL2BAN=${FAIL2BAN_MAXRETRY} ошибок за ${FAIL2BAN_FINDTIME}, бан ${FAIL2BAN_BANTIME}"
+  echo "BROWSER=Google Chrome"
   echo
 }
 
@@ -213,18 +219,18 @@ ensure_user_directories() {
 configure_default_browser() {
   local home="/home/${WORKSPACE_USER}"
 
-  echo "==> Настраиваем Falkon браузером по умолчанию"
+  echo "==> Настраиваем Google Chrome браузером по умолчанию"
 
-  cat > "${home}/.config/mimeapps.list" <<'EOF'
+  cat > "${home}/.config/mimeapps.list" <<EOF
 [Default Applications]
-x-scheme-handler/http=org.kde.falkon.desktop
-x-scheme-handler/https=org.kde.falkon.desktop
-text/html=org.kde.falkon.desktop
+x-scheme-handler/http=${BROWSER_DESKTOP_ID}
+x-scheme-handler/https=${BROWSER_DESKTOP_ID}
+text/html=${BROWSER_DESKTOP_ID}
 
 [Added Associations]
-x-scheme-handler/http=org.kde.falkon.desktop;
-x-scheme-handler/https=org.kde.falkon.desktop;
-text/html=org.kde.falkon.desktop;
+x-scheme-handler/http=${BROWSER_DESKTOP_ID};
+x-scheme-handler/https=${BROWSER_DESKTOP_ID};
+text/html=${BROWSER_DESKTOP_ID};
 EOF
 
   chown "${WORKSPACE_USER}:${WORKSPACE_USER}" "${home}/.config/mimeapps.list"
@@ -341,6 +347,26 @@ install_fail2ban() {
 
   install -d -m 755 /etc/fail2ban/filter.d
   install -d -m 755 /etc/fail2ban/jail.d
+}
+
+
+install_google_chrome() {
+  if [[ -x "${BROWSER_BIN}" ]]; then
+    return
+  fi
+
+  echo "==> Устанавливаем Google Chrome"
+
+  mkdir -p /root/Downloads
+
+  wget -q --show-progress -O "${CHROME_DEB_FILE}" "${CHROME_DEB_URL}"
+  DEBIAN_FRONTEND=noninteractive apt install -y "${CHROME_DEB_FILE}"
+  rm -f "${CHROME_DEB_FILE}"
+
+  if [[ ! -x "${BROWSER_BIN}" ]]; then
+    echo "ОШИБКА: ${BROWSER_BIN} не найден после установки Google Chrome."
+    exit 1
+  fi
 }
 
 
@@ -678,6 +704,7 @@ show_status() {
   echo "CADDY_ACME_MODE=${CADDY_ACME_MODE}"
   echo "URL=https://${DOMAIN}/vnc.html?resize=scale&autoconnect=true"
   echo "FAIL2BAN=${FAIL2BAN_JAIL_NAME}, maxretry=${FAIL2BAN_MAXRETRY}, findtime=${FAIL2BAN_FINDTIME}, bantime=${FAIL2BAN_BANTIME}"
+  echo "BROWSER=${BROWSER_BIN}"
   echo
 
   for svc in "${ALL_SERVICES[@]}"; do
@@ -696,6 +723,10 @@ show_status() {
   else
     echo "ChatGPT НЕ запущен."
   fi
+
+  echo
+  echo "Процесс Chrome:"
+  pgrep -afu "${WORKSPACE_USER}" 'google-chrome|chrome' || echo "Chrome НЕ запущен."
 
   echo
   echo "HTTPS-порты:"
@@ -764,7 +795,6 @@ install_everything() {
     autocutsel \
     xterm \
     xfonts-base \
-    falkon \
     tmux \
     vim \
     nano \
@@ -786,6 +816,8 @@ install_everything() {
   passwd "${WORKSPACE_USER}"
 
   ensure_user_directories
+
+  install_google_chrome
   configure_default_browser
 
   echo
@@ -847,7 +879,7 @@ EOF
   echo "==> Создаём сервис Openbox + ChatGPT"
   cat > /etc/systemd/system/chatgpt-desktop.service <<EOF
 [Unit]
-Description=Openbox session with ChatGPT, Falkon and terminal
+Description=Openbox session with ChatGPT, Chrome and terminal
 After=chatgpt-xvfb.service
 Requires=chatgpt-xvfb.service
 
@@ -864,7 +896,7 @@ Environment=XDG_RUNTIME_DIR=/run/chatgpt-workspace
 Environment=XDG_CONFIG_HOME=/home/${WORKSPACE_USER}/.config
 Environment=XDG_CACHE_HOME=/home/${WORKSPACE_USER}/.cache
 Environment=XDG_CURRENT_DESKTOP=Openbox
-Environment=BROWSER=/usr/bin/falkon
+Environment=BROWSER=${BROWSER_BIN}
 
 WorkingDirectory=/home/${WORKSPACE_USER}
 
@@ -1004,7 +1036,7 @@ EOF
   echo "1. Caddy: логин ${CADDY_USER} и заданный HTTPS-пароль."
   echo "2. noVNC: отдельный VNC-пароль."
   echo "3. Внутри рабочего стола запустится ChatGPT и Terminal."
-  echo "4. При входе в ChatGPT браузер должен открыться в Falkon."
+  echo "4. Для авторизации OpenAI используется Google Chrome."
   echo "5. Для текста работает clipboard noVNC/X11."
   echo
   echo "Если что-то не работает:"
