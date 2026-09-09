@@ -246,6 +246,13 @@ write_openbox_autostart() {
   cat > "${home}/.config/openbox/autostart" <<'EOF'
 xsetroot -solid "#1e1e1e" &
 
+setxkbmap -layout "us,ru" -option "grp:alt_shift_toggle" -print \
+  | sed -E 's/\+inet\([^)]*\)//g' \
+  | xkbcomp -w 0 - "$DISPLAY"
+
+xset r on
+xset r rate 400 30
+
 /usr/bin/autocutsel -fork
 /usr/bin/autocutsel -selection PRIMARY -fork
 
@@ -267,6 +274,51 @@ EOF
 
   chown "${WORKSPACE_USER}:${WORKSPACE_USER}" "${home}/.config/openbox/autostart"
   chmod 700 "${home}/.config/openbox/autostart"
+}
+
+
+write_openbox_menu() {
+  local home="/home/${WORKSPACE_USER}"
+
+  echo "==> Создаём menu.xml для Openbox"
+
+  cat > "${home}/.config/openbox/menu.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:schemaLocation="http://openbox.org/ file:///usr/share/openbox/menu.xsd">
+  <menu id="root-menu" label="Workspace">
+    <item label="Terminal">
+      <action name="Execute">
+        <command>/usr/bin/xterm -title Terminal</command>
+      </action>
+    </item>
+
+    <item label="Google Chrome">
+      <action name="Execute">
+        <command>${BROWSER_BIN} --disable-gpu</command>
+      </action>
+    </item>
+
+    <item label="ChatGPT Desktop">
+      <action name="Execute">
+        <command>/usr/bin/chatgpt --disable-gpu</command>
+      </action>
+    </item>
+
+    <separator />
+
+    <item label="Reload Openbox Config">
+      <action name="Execute">
+        <command>/usr/bin/openbox --reconfigure</command>
+      </action>
+    </item>
+  </menu>
+</openbox_menu>
+EOF
+
+  chown "${WORKSPACE_USER}:${WORKSPACE_USER}" "${home}/.config/openbox/menu.xml"
+  chmod 600 "${home}/.config/openbox/menu.xml"
 }
 
 
@@ -826,6 +878,7 @@ install_everything() {
   runuser -l "${WORKSPACE_USER}" -c 'x11vnc -storepasswd'
 
   write_openbox_autostart
+  write_openbox_menu
 
   echo "==> Создаём swap, если его ещё нет"
   if ! swapon --show=NAME | grep -qx '/swapfile'; then
@@ -925,7 +978,7 @@ Group=${WORKSPACE_USER}
 
 Environment=DISPLAY=${DISPLAY_NUM}
 
-ExecStart=/usr/bin/x11vnc -display ${DISPLAY_NUM} -localhost -rfbport ${VNC_PORT} -rfbauth /home/${WORKSPACE_USER}/.vnc/passwd -forever -shared -noxrecord -noxfixes -noxdamage
+ExecStart=/usr/bin/x11vnc -xkb -display ${DISPLAY_NUM} -localhost -rfbport ${VNC_PORT} -rfbauth /home/${WORKSPACE_USER}/.vnc/passwd -forever -shared -noxrecord -noxfixes -noxdamage
 
 Restart=always
 RestartSec=3
@@ -1036,8 +1089,9 @@ EOF
   echo "1. Caddy: логин ${CADDY_USER} и заданный HTTPS-пароль."
   echo "2. noVNC: отдельный VNC-пароль."
   echo "3. Внутри рабочего стола запустится ChatGPT и Terminal."
-  echo "4. Для авторизации OpenAI используется Google Chrome."
-  echo "5. Для текста работает clipboard noVNC/X11."
+  echo "4. Правый клик по пустому рабочему столу открывает меню Openbox."
+  echo "5. Для авторизации OpenAI используется Google Chrome."
+  echo "6. Для текста работает clipboard noVNC/X11."
   echo
   echo "Если что-то не работает:"
   echo "bash install.sh"
